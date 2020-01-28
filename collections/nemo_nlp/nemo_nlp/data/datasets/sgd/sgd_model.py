@@ -10,21 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-torch.manual_seed(0)
 
-class Net(nn.Module):
-
-    def __init__(self):
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(3, 3)
-        self.z = torch.tensor([[4.0,4.,4.]], requires_grad=True)
-
-    def forward(self, x):
-        x = torch.cat([self.z,x])
-        x = F.relu(self.fc1(x))
-        return x.view(-1, 3)
-    
-    
+from nemo.backends.pytorch.nm import TrainableNM, LossNM
+from nemo.core.neural_types import *
+   
 class Logits(nn.Module):
     def __init__(self,
                  num_classes,
@@ -103,21 +92,61 @@ class SGDModel(nn.Module):
         self.none_intent_vector = torch.nn.Parameter(self.none_intent_vector)
     
         self.intent_layer = Logits(1, embedding_dim)
+        self.requested_slots_layer = Logits(1, embedding_dim)
+        
+        self.cat_slot_value_layer = Logits(1, embedding_dim)
+
+        # Slot status values: none, dontcare, active.
+        self.cat_slot_status_layer = Logits(3, embedding_dim)
+        self.noncat_slot_layer = Logits(3, embedding_dim)
+        
+        # dim 2 for non_categorical slot - to represent start and end position
+        self.noncat_layer1 = nn.Linear(2 * embedding_dim, embedding_dim)
+        self.noncat_activation = torch.nn.functional.gelu
+        self.noncat_layer2 = nn.Linear(embedding_dim, 2)
 
     def forward(self,
                 encoded_utterance,
                 intent_embeddings,
-                num_intents):
+                num_intents,
+                req_slot_emb,
+                cat_slot_emb,
+                cat_slot_value_emb,
+                num_categorical_slot_values,
+                utterance_mask,
+                token_embeddings,
+                noncat_slot_emb):
         
         """
         encoded_utterance - [CLS] token hidden state from BERT encoding of the utterance
         
         """
-        
         logit_intent_status = self._get_intents(encoded_utterance,
                                                 intent_embeddings,
                                                 num_intents)
-        return logit_intent_status
+        
+        logit_req_slot_status = self._get_requested_slots(encoded_utterance,
+                                                          req_slot_emb)
+        
+        logit_cat_slot_status, logit_cat_slot_value = self._get_categorical_slot_goals(encoded_utterance,
+                                                                           cat_slot_emb,
+                                                                           cat_slot_value_emb,
+                                                                           num_categorical_slot_values)
+        
+        logit_noncat_slot_status, logit_noncat_slot_start, logits_noncat_slot_end = \
+            self._get_noncategorical_slot_goals(encoded_utterance,
+            utterance_mask,
+            noncat_slot_emb,
+            token_embeddings)
+
+        return (logit_intent_status,
+                logit_req_slot_status,
+                logit_cat_slot_status,
+                logit_cat_slot_value,
+                logit_noncat_slot_status,
+                logit_noncat_slot_start,
+                logits_noncat_slot_end)
+                
     
     def _get_intents(self,
                      encoded_utterance,
@@ -134,15 +163,102 @@ class SGDModel(nn.Module):
         # Add a trainable vector for the NONE intent.
         repeated_none_intent_vector = self.none_intent_vector.repeat(2,1,1)
         intent_embeddings = torch.cat([repeated_none_intent_vector, intent_embedding], axis=1)
-        logits = self.intent_layer(encoded_utterance, intent_embeddings)
         
+        logits = self.intent_layer(encoded_utterance, intent_embeddings)
         logits = logits.squeeze(axis=-1) # Shape: (batch_size, max_intents + 1)
+        
         # Mask out logits for padded intents, 1 is added to account for NONE intent.
-        mask = torch.arange(0, max_num_intents + 1, 1) < torch.unsqueeze(num_intents + 1, dim=-1)
-        negative_logits = -0.7 * torch.ones(logits.size()) * torch.finfo(logits.dtype).max
+        mask, negative_logits = self._get_mask(logits,
+                                               max_length=max_num_intents + 1,
+                                               actual_length=num_intents + 1)
         return torch.where(mask, logits, negative_logits)
     
+    def _get_mask(self,
+                  logits,
+                  max_length,
+                  actual_length):
+        mask = torch.arange(0, max_length, 1) < torch.unsqueeze(actual_length, dim=-1)
+        negative_logits = -0.7 * torch.ones(logits.size()) * torch.finfo(logits.dtype).max
+        return mask, negative_logits
     
+    def _get_requested_slots(self,
+                             encoded_utterance,
+                             requested_slot_emb):
+        """Obtain logits for requested slots."""
+        logits = self._get_logits(encoded_utterance, requested_slot_emb)
+        return logits.squeeze(axis=-1)
+    
+    def _get_categorical_slot_goals(self,
+                                    encoded_utterance,
+                                    cat_slot_emb,
+                                    cat_slot_value_emb,
+                                    num_categorical_slot_values):
+        """
+        Obtain logits for status and values for categorical slots
+        Slot status values: none, dontcare, active
+        """
+        
+        # Predict the status of all categorical slots.
+        status_logits = self.cat_slot_status_layer(encoded_utterance,
+                                                   cat_slot_emb)
+        
+        # Predict the goal value.
+        # Shape: (batch_size, max_categorical_slots, max_categorical_values,
+        # embedding_dim).
+        _, max_num_slots, max_num_values, embedding_dim = cat_slot_value_emb.size()
+        cat_slot_value_emb_reshaped = cat_slot_value_emb.view(-1, max_num_slots * max_num_values, embedding_dim)
+        
+        value_logits = self.cat_slot_value_layer(encoded_utterance,
+                                                 cat_slot_value_emb_reshaped)
+
+        # Reshape to obtain the logits for all slots.
+        value_logits = value_logits.view(-1, max_num_slots, max_num_values)
+
+        # Mask out logits for padded slots and values because they will be softmaxed
+        mask, negative_logits = self._get_mask(logits,
+                                               max_num_values,
+                                               num_categorical_slot_values)
+        value_logits = torch.where(mask, value_logits, negative_logits)
+        return status_logits, value_logits
+    
+    def _get_noncategorical_slot_goals(self,
+                                        encoded_utterance,
+                                        utterance_mask,
+                                        noncat_slot_emb,
+                                        token_embeddings):
+        """
+        Obtain logits for status and slot spans for non-categorical slots.
+        Slot status values: none, dontcare, active
+        """
+        # Predict the status of all non-categorical slots.
+        max_num_slots = noncat_slot_emb.size()[1]
+        status_logits = self.noncat_slot_layer(encoded_utterance,
+                                               noncat_slot_emb)
+    
+        # Predict the distribution for span indices.
+        max_num_tokens = token_embeddings.size()[1]
+        
+        repeated_token_embeddings = token_embeddings.unsqueeze(1).repeat(1, max_num_slots, 1, 1)
+        repeated_slot_embeddings = noncat_slot_emb.unsqueeze(2).repeat(1, 1, max_num_tokens, 1)
+        
+        # Shape: (batch_size, max_num_slots, max_num_tokens, 2 * embedding_dim).
+        slot_token_embeddings = torch.cat([repeated_slot_embeddings, repeated_token_embeddings], axis=3)
+    
+        # Project the combined embeddings to obtain logits, Shape: (batch_size, max_num_slots, max_num_tokens, 2)
+        span_logits = self.noncat_layer1(slot_token_embeddings)
+        span_logits = self.noncat_activation(span_logits)
+        span_logits = self.noncat_layer2(span_logits)
+    
+        # Mask out invalid logits for padded tokens.
+        utterance_mask = utterance_mask.to(bool) # Shape: (batch_size, max_num_tokens).
+
+        repeated_utterance_mask = utterance_mask.unsqueeze(1).repeat(1, max_num_slots, 1, 2)
+        negative_logits = -0.7 * torch.ones(span_logits.size()) * torch.finfo(span_logits.dtype).max
+        span_logits = torch.where(repeated_utterance_mask, span_logits, negative_logits)
+        
+        # Shape of both tensors: (batch_size, max_num_slots, max_num_tokens).
+        span_start_logits, span_end_logits = torch.unbind(span_logits, dim=3)
+        return status_logits, span_start_logits, span_end_logits
 
 utter = torch.tensor([[[1.,2.,3., 4., 5]],[[7.,8.,9., 8., 5]]])
 num_classes = 1 # need to choose the most probable intent
