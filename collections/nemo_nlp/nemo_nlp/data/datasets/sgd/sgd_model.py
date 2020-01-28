@@ -59,7 +59,7 @@ class Logits(nn.Module):
         encoded_utterance - [CLS] token hidden state from BERT encoding of the utterance
         
         """
-        _, num_elements, _ = [*element_embeddings.size()]
+        _, num_elements, _ = element_embeddings.size()
         
         # Project the utterance embeddings.
         utterance_embedding = self.utterance_proj(encoded_utterance)
@@ -97,6 +97,11 @@ class SGDModel(nn.Module):
         super().__init__()
         
         # Add a trainable vector for the NONE intent
+        self.none_intent_vector = torch.empty((1, 1, embedding_dim), requires_grad=True)
+        # TODO truncated norm init
+        nn.init.normal_(self.none_intent_vector, std=0.02)
+        self.none_intent_vector = torch.nn.Parameter(self.none_intent_vector)
+    
         self.intent_layer = Logits(1, embedding_dim)
 
     def forward(self,
@@ -108,15 +113,11 @@ class SGDModel(nn.Module):
         encoded_utterance - [CLS] token hidden state from BERT encoding of the utterance
         
         """
+        
         logit_intent_status = self._get_intents(encoded_utterance,
                                                 intent_embeddings,
                                                 num_intents)
-        
         return logit_intent_status
-        
-        
-    def _get_trainable_none_intent(self):
-        torch.empty(3, 5)
     
     def _get_intents(self,
                      encoded_utterance,
@@ -128,40 +129,51 @@ class SGDModel(nn.Module):
             num_intents - number of intents associated with a particular service
             encoded_utterance - representation of untterance
         """
-        batch_size, max_num_intents, _ = [*intent_embeddings.size()]
+        batch_size, max_num_intents, _ = intent_embeddings.size()
         
         # Add a trainable vector for the NONE intent.
-        
-
+        repeated_none_intent_vector = self.none_intent_vector.repeat(2,1,1)
+        intent_embeddings = torch.cat([repeated_none_intent_vector, intent_embedding], axis=1)
         logits = self.intent_layer(encoded_utterance, intent_embeddings)
-        # Shape: (batch_size, max_intents + 1)
-        logits = logits.squeeze(axis=-1)
-        # Mask out logits for padded intents. 1 is added to account for NONE intent.
-        mask = torch.arange(0, max_num_intents, 1) < torch.unsqueeze(num_intents, dim=-1)
+        
+        logits = logits.squeeze(axis=-1) # Shape: (batch_size, max_intents + 1)
+        # Mask out logits for padded intents, 1 is added to account for NONE intent.
+        mask = torch.arange(0, max_num_intents + 1, 1) < torch.unsqueeze(num_intents + 1, dim=-1)
         negative_logits = -0.7 * torch.ones(logits.size()) * torch.finfo(logits.dtype).max
         return torch.where(mask, logits, negative_logits)
     
     
 
-utter = torch.tensor([[1.,2.,3., 4., 5]])
+utter = torch.tensor([[[1.,2.,3., 4., 5]],[[7.,8.,9., 8., 5]]])
 num_classes = 1 # need to choose the most probable intent
 num_elements = 4 # max num of intents per service
-num_intents=torch.tensor([3, 4, 3, 2])
+num_intents=torch.tensor([4, 2])
        
-intent_embedding = torch.tensor([[1., 1., 1., 1., 1.],
+intent_embedding = torch.tensor([[[1., 1., 1., 1., 1.],
                                  [2., 2., 2., 2., 2.],
                                  [0., 0., 0., 0., 0.],
-                                 [0., 0., 0., 0., 0.]]).unsqueeze(0) # 1, 4, 5
+                                 [0., 0., 0., 0., 0.]],
+                                [[1., 1., 1., 1., 1.],
+                                 [2., 2., 2., 2., 2.],
+                                 [0., 0., 0., 0., 0.],
+                                 [0., 0., 0., 0., 0.]]]) # 1, 4, 5
     
-embedding_dim = utter.size()[1]
+embedding_dim = utter.size()[-1]
 net = SGDModel(num_classes=num_classes,
                embedding_dim=embedding_dim)
+print('\n\n', '#'*30)
 print(net)
+print('\n\n', '#'*30)
 logits = net(utter,
              intent_embedding,
              num_intents)
 print(logits)
+print('\n\n', '#'*30)
+params = list(net.parameters())
 
+
+for name, param in net.named_parameters():
+    print (name, param.data)
 
 
 
