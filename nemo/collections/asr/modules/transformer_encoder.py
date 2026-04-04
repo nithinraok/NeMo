@@ -399,6 +399,7 @@ class TransformerEncoder(nn.Module):
                 pre_encode: str = "conv", # "conv" or "stacking"
                 nan_debug: bool = True,
                 qk_norm: bool = False,
+                subsampling_factor: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
@@ -408,7 +409,7 @@ class TransformerEncoder(nn.Module):
         elif pre_encode == "depth_conv":
             self.pre_encode = DepthwiseConvSubsampling(n_mels, d_model)
         elif pre_encode == "stacking":
-            self.pre_encode = NGPTStackingSubsampling(subsampling_factor=4, feat_in=n_mels, feat_out=d_model)
+            self.pre_encode = NGPTStackingSubsampling(subsampling_factor=subsampling_factor, feat_in=n_mels, feat_out=d_model)
         else:
             raise ValueError(f"Invalid pre_encode: {pre_encode}. Choose from: conv, depth_conv, stacking")
 

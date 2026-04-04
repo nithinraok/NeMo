@@ -126,6 +126,7 @@ model:
     qkv_bias: False
     causal_mask: False
     pre_encode: "depth_conv"  # Options: conv, depth_conv, stacking
+    subsampling_factor: 4  # Subsampling factor for stacking pre-encoder (4 or 8)
 
   decoder:
     _target_: nemo.collections.asr.modules.RNNTDecoder
