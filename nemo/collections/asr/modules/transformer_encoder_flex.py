@@ -27,9 +27,9 @@ from torch.nn.attention.flex_attention import (
 )
 
 # Compile flex_attention once at module level for fused Triton kernels.
-# dynamic=False: recompiles per unique (B, T) shape, optimal per-shape perf.
-# Switch to dynamic=True if recompilation overhead is too high with variable T.
-flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+# dynamic=True: generates shape-generic Triton kernels so variable (B, T) from
+# Lhotse bucketed batching does not trigger repeated recompilation.
+flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 
 
 # ── Mask modifier builders ──────────────────────────────────────────────
