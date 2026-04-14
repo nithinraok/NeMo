@@ -170,8 +170,8 @@ class MultiHeadAttentionWithFlex(nn.Module):
         values = self.w_value(x).view(B, T, H, self.head_dim).transpose(1, 2)
 
         if self.qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
+            queries = self.q_norm(queries).to(values.dtype)
+            keys = self.k_norm(keys).to(values.dtype)
 
         output = flex_attention_compiled(queries, keys, values, block_mask=block_mask)
 
