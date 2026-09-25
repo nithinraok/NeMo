@@ -15,8 +15,8 @@
 
 import math
 import random
-from collections import Counter
 
+import numpy as np
 import torch
 
 from nemo.collections.asr.data.ssl_dataset import AudioNoiseBatch
@@ -140,7 +140,10 @@ class SpeakerNoiseAugmentation(Serialization):
             noise=noise,
             noise_len=noise_len,
             noisy_audio=batch.audio + noise,
-            noisy_audio_len=noise_len,
+            # The noisy signal is as long as the speech. `noise_len` of an un-augmented row is the raw
+            # noise-file length (shorter than the speech for e.g. 10 s DNS clips), which truncated the
+            # encoder input and the loss for those rows.
+            noisy_audio_len=batch.audio_len.clone(),
         )
 
 
@@ -159,7 +162,15 @@ class MultiSpeakerNoiseAugmentation(SpeakerNoiseAugmentation):
         max_num_segments: int = 5,
         min_num_speakers: int = 1,
         max_num_speakers: int = 4,
+        add_raw_noise_to_unaugmented: bool = True,
     ):
+        """
+        Args:
+            add_raw_noise_to_unaugmented: legacy behaviour (default) adds the *unscaled* sampled noise to
+                the rows that were not selected for augmentation (probability ``1 - prob``). Set to False
+                to leave those rows clean; the dataset then only loads noise files for rows that mix in
+                noise (``prob * noise_ratio`` of the batch), see ``sample_row_modes``.
+        """
         super().__init__(
             prob=prob,
             noise_ratio=noise_ratio,
@@ -174,8 +185,33 @@ class MultiSpeakerNoiseAugmentation(SpeakerNoiseAugmentation):
         self.max_num_segments = max_num_segments
         self.min_num_speakers = min_num_speakers
         self.max_num_speakers = max_num_speakers
+        self.add_raw_noise_to_unaugmented = add_raw_noise_to_unaugmented
 
-    def __call__(self, batch: AudioNoiseBatch) -> AudioNoiseBatch:
+    def sample_row_modes(self, batch_size: int) -> list:
+        """Draw the per-row augmentation decision up front: None (not augmented), "noise" or "speech".
+        Lets the dataset read noise files only for the rows that will use them."""
+        modes = []
+        for _ in range(batch_size):
+            if random.random() > self.prob:
+                modes.append(None)
+            elif random.random() < self.noise_ratio or batch_size == 1:
+                modes.append("noise")
+            else:
+                modes.append("speech")
+        return modes
+
+    @staticmethod
+    def _split_segments(mix_len: int, num_segments: int) -> list:
+        """Same distribution as ``list(Counter(random.choices(range(num_segments), k=mix_len)).values())``
+        (multinomial counts in order of first appearance, empty segments dropped) without building a
+        Python list of ``mix_len`` elements (~20-60 ms per row for 8-40 s audio)."""
+        if num_segments == 1:
+            return [mix_len]
+        draws = np.random.randint(num_segments, size=mix_len)
+        labels, first_idx, counts = np.unique(draws, return_index=True, return_counts=True)
+        return counts[np.argsort(first_idx)].tolist()
+
+    def __call__(self, batch: AudioNoiseBatch, modes: list | None = None) -> AudioNoiseBatch:
         audio_signal = batch.audio
         audio_lengths = batch.audio_len
         batch_size = audio_signal.size(0)
@@ -183,7 +219,14 @@ class MultiSpeakerNoiseAugmentation(SpeakerNoiseAugmentation):
         noise = batch.noise
         noise_len = batch.noise_len
         for i in range(batch_size):
-            if random.random() > self.prob:
+            if modes is None:
+                if random.random() > self.prob:
+                    if not self.add_raw_noise_to_unaugmented:
+                        noise[i].zero_()
+                    continue
+            elif modes[i] is None:
+                if not self.add_raw_noise_to_unaugmented:
+                    noise[i].zero_()
                 continue
 
             # randomly select the length of mixing segment
@@ -199,14 +242,18 @@ class MultiSpeakerNoiseAugmentation(SpeakerNoiseAugmentation):
             num_speakers = min(num_speakers, batch_size)
 
             # randomly chunk mix_len into num_segments
-            segment_lens = list(Counter(random.choices(range(num_segments), k=mix_len)).values())
+            segment_lens = self._split_segments(mix_len, num_segments)
 
             # randomly select the energy ratio between speech and noise
-            if random.random() < self.noise_ratio or batch_size == 1:
+            if modes is not None:
+                mode = modes[i]
+            elif random.random() < self.noise_ratio or batch_size == 1:
                 mode = "noise"
-                energy_ratio = random.uniform(self.min_r_noise, self.max_r_noise)
             else:
                 mode = "speech"
+            if mode == "noise":
+                energy_ratio = random.uniform(self.min_r_noise, self.max_r_noise)
+            else:
                 energy_ratio = random.uniform(self.min_r_speech, self.max_r_speech)
 
             noise_segments = self.get_noise_segments(i, batch, segment_lens, num_speakers, mode)
@@ -238,7 +285,7 @@ class MultiSpeakerNoiseAugmentation(SpeakerNoiseAugmentation):
             noise=noise,
             noise_len=noise_len,
             noisy_audio=batch.audio + noise,
-            noisy_audio_len=noise_len,
+            noisy_audio_len=batch.audio_len.clone(),  # see SpeakerNoiseAugmentation.__call__
         )
 
     def get_noise_segments(self, batch_idx, batch, segment_lens, num_speakers, mode):

@@ -210,7 +210,10 @@ def load_noise_audio(
                 target_sr=sample_rate,
             )
 
-            if sum(audio_segment.samples) > 0:
+            # np.any, not builtins.sum: the Python-level sum walks every sample (~40 ms for 40 s of
+            # audio vs 0.07 ms) and `sum(x) > 0` also rejects non-silent noise whose samples sum to a
+            # negative value, forcing up to max_trial re-reads (measured 11-14 reads per utterance).
+            if np.any(audio_segment.samples):
                 # break if the segment is not empty
                 break
             cnt += 1
@@ -222,7 +225,7 @@ def load_noise_audio(
             target_sr=sample_rate,
         )
 
-    if sum(audio_segment.samples) == 0:
+    if not np.any(audio_segment.samples):
         logging.warning(
             f"Loaded noise audio is empty: {sample}, with sampled offset={offset}, duration={max_dur}. Adding white noise."
         )
@@ -440,7 +443,18 @@ class TarredAudioNoiseDataset(audio_to_text.TarredAudioToCharDataset):
 
 
 class LhotseAudioNoiseDataset(LhotseAudioLoadingDatasetMixin, torch.utils.data.Dataset):
-    def __init__(self, noise_manifest: str | None = None, batch_augmentor_cfg: DictConfig = None):
+    def __init__(
+        self,
+        noise_manifest: str | None = None,
+        batch_augmentor_cfg: DictConfig = None,
+        return_noise: bool = True,
+    ):
+        """
+        Args:
+            return_noise: if False, drop ``noise``/``noise_len`` from the returned batch. The model forward
+                only consumes ``audio`` and ``noisy_audio``; the noise tensor is otherwise copied through
+                worker shared memory, pinned and sent to the GPU for nothing (1/3 of the batch bytes).
+        """
         super().__init__()
 
         if batch_augmentor_cfg:
@@ -451,15 +465,30 @@ class LhotseAudioNoiseDataset(LhotseAudioLoadingDatasetMixin, torch.utils.data.D
         self.batch_augmentor = batch_augmentor
         self.noise_data = load_noise_manifest(noise_manifest)
         self.load_audio = AudioSamples(fault_tolerant=True)
+        self.return_noise = return_noise
 
     def __getitem__(self, cuts):
 
         audios, audio_lens, cuts = self.load_audio_with_cuts(cuts)
+
+        # Decide per row up front which rows actually consume a noise file, so we only read those.
+        # "speech" rows mix in another utterance of the batch and never use the sampled noise; rows
+        # that are not augmented only use it with the legacy ``add_raw_noise_to_unaugmented=True``.
+        modes = None
+        if self.batch_augmentor is not None and hasattr(self.batch_augmentor, "sample_row_modes"):
+            modes = self.batch_augmentor.sample_row_modes(len(cuts))
+            keep_raw = getattr(self.batch_augmentor, "add_raw_noise_to_unaugmented", True)
+            needs_noise = [m == "noise" or (m is None and keep_raw) for m in modes]
+        else:
+            needs_noise = [True] * len(cuts)
+
         if len(self.noise_data) > 0:
-            sampled_noises = [sample_noise(self.noise_data, cut.sampling_rate, cut.num_samples) for cut in cuts]
-            sampled_noises, sampled_noises_lens = zip(*sampled_noises)
-            sampled_noises = torch.stack(sampled_noises).float()
-            sampled_noises_lens = torch.tensor(sampled_noises_lens).long()
+            sampled_noises = torch.zeros_like(audios)
+            sampled_noises_lens = audio_lens.clone()
+            for i, cut in enumerate(cuts):
+                if needs_noise[i]:
+                    noise_i, sampled_noises_lens[i] = sample_noise(self.noise_data, cut.sampling_rate, cut.num_samples)
+                    sampled_noises[i, : noise_i.size(0)] = noise_i[: sampled_noises.size(1)]
         else:
             sampled_noises = torch.zeros_like(audios)
             sampled_noises_lens = audio_lens
@@ -472,11 +501,14 @@ class LhotseAudioNoiseDataset(LhotseAudioLoadingDatasetMixin, torch.utils.data.D
         )
 
         if self.batch_augmentor is not None:
-            output = self.batch_augmentor(output)
+            output = self.batch_augmentor(output, modes=modes) if modes is not None else self.batch_augmentor(output)
         else:
             output.noisy_audio = output.audio + output.noise
             output.noisy_audio_len = output.audio_len
 
+        if not self.return_noise:
+            output.noise = None
+            output.noise_len = None
         return output
 
 

@@ -139,9 +139,15 @@ class RandomProjectionVectorQuantizer(NeuralModule, Exportable):
             # (B, T, num_books, num_classes) -> (B, T, num_books)
             xid = xid.max(dim=-1)[1]
         elif self.dist_fn == "l2":
-            # (B, T, num_books, code_dim) -> (B, T, num_books, code_dim, num_classes)
-            xid = x.unsqueeze(-1) - self.codebooks.transpose(1, 2).unsqueeze(0).unsqueeze(0)
-            xid = xid.norm(dim=-2).argmin(dim=-1)
+            # argmin_c ||x - c||^2 = argmax_c (<x, c> - ||c||^2 / 2). The previous broadcast-subtract
+            # materialized a (B, T, num_books, code_dim, num_classes) float64 tensor (~25 GB for a
+            # 48 x 40 s batch); this is one small matmul with identical argmin up to fp ties.
+            # fp32 with autocast off: under bf16 autocast einsum would round the scores to bf16 and
+            # change the argmax for near-ties.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                codebooks = self.codebooks.float()
+                scores = torch.einsum('btnd,ncd->btnc', x.float(), codebooks) - 0.5 * codebooks.pow(2).sum(-1)
+            xid = scores.argmax(dim=-1)
         else:
             raise ValueError(f"Unknown distance function {self.dist_fn}, must be one of {self.DIST_FN_LIST}")
 
