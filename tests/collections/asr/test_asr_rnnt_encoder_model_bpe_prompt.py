@@ -576,3 +576,24 @@ class TestLhotseSpeechToTextBpeDatasetWithPromptIndexFallback:
             cfg={'prompt_dictionary': prompt_dict, 'fallback_unknown_lang': True, 'default_lang': 'yy'},
         )
         assert lenient_auto._get_prompt_index(None) == 0
+
+    @pytest.mark.unit
+    def test_prompt_lang_tag_overrides_supervision_language(self, rnnt_asr_model_with_prompt):
+        from lhotse import MonoCut, SupervisionSegment
+        from lhotse.testing.dummies import dummy_recording
+
+        prompt_dict = {'auto': 0, 'hi': 1, 'hi-cs': 2}
+        dataset = LhotseSpeechToTextBpeDatasetWithPromptIndex(
+            tokenizer=rnnt_asr_model_with_prompt.tokenizer,
+            cfg={'prompt_dictionary': prompt_dict, 'default_prompt_mode': 'langID'},
+        )
+
+        def make_cut(cut_id):
+            recording = dummy_recording(0, duration=1.0)
+            supervision = SupervisionSegment(id=cut_id, recording_id=recording.id, start=0, duration=1.0, language='hi')
+            return MonoCut(id=cut_id, start=0, duration=1.0, channel=0, recording=recording, supervisions=[supervision])
+
+        native, code_switched = make_cut('native'), make_cut('code_switched')
+        code_switched.prompt_lang = 'hi-cs'  # what an input_cfg `tags: {prompt_lang: hi-cs}` entry attaches
+        assert dataset._get_prompt_index_for_cut(native) == 1
+        assert dataset._get_prompt_index_for_cut(code_switched) == 2
