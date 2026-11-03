@@ -741,6 +741,17 @@ class ModelPT(LightningModule, Model):
         if lr is not None:
             optimizer_args['lr'] = lr
 
+        if optimizer_cls is None and optimizer_name == 'muon':
+            # Muon routes parameters by name and module type (hidden matrices -> Muon, the rest -> AdamW).
+            self._optimizer_param_groups = optim.split_param_groups_for_muon(
+                self._optimizer_param_groups,
+                named_parameters=self.named_parameters(),
+                named_modules=self.named_modules(),
+                adamw_patterns=optimizer_args.pop('adamw_patterns', None),
+                muon_patterns=optimizer_args.pop('muon_patterns', None),
+                split_patterns=optimizer_args.pop('split_patterns', None),
+            )
+
         # Actually instantiate the optimizer
         if optimizer_cls is not None:
             if inspect.isclass(optimizer_cls):
