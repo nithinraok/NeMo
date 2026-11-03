@@ -565,3 +565,161 @@ class TestEncDecHybridRNNTCTCBPEModelWithPrompt:
         # Should not crash and should produce valid output
         assert encoded.shape[0] == 1
         assert encoded_len.shape[0] == 1
+
+
+def _transformer_hybrid_prompt_config(test_data_dir, prompt_injection):
+    """Small TransformerEncoder (FeatureStacking pre-encoder) hybrid model, like the indic-granary runs."""
+    model_defaults = {
+        'enc_hidden': 64,
+        'pred_hidden': 32,
+        'initialize_prompt_feature': True,
+        'num_prompts': 8,
+        'prompt_injection': prompt_injection,
+        'prompt_dictionary': {'auto': 0, 'en': 1, 'hi': 2, 'ur': 3},
+    }
+    return DictConfig(
+        {
+            'preprocessor': {'cls': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor', 'params': {}},
+            'model_defaults': model_defaults,
+            'encoder': {
+                '_target_': 'nemo.collections.asr.modules.transformer_encoder.TransformerEncoder',
+                'feat_in': 64,
+                'd_model': model_defaults['enc_hidden'],
+                'n_heads': 4,
+                'n_layers': 1,
+                'drop_rate': 0.0,
+                'subsampling': 'feature_stacking',
+                'subsampling_factor': 4,
+                'self_attention_model': 'rope',
+            },
+            'decoder': {
+                '_target_': 'nemo.collections.asr.modules.RNNTDecoder',
+                'prednet': {'pred_hidden': model_defaults['pred_hidden'], 'pred_rnn_layers': 1},
+            },
+            'joint': {
+                '_target_': 'nemo.collections.asr.modules.RNNTJoint',
+                'jointnet': {'joint_hidden': 32, 'activation': 'relu'},
+            },
+            'aux_ctc': {
+                'ctc_loss_weight': 0.3,
+                'use_cer': False,
+                'ctc_reduction': 'mean_batch',
+                'decoder': {
+                    '_target_': 'nemo.collections.asr.modules.ConvASRDecoder',
+                    'feat_in': model_defaults['enc_hidden'],
+                    'num_classes': -1,
+                    'vocabulary': [],
+                },
+                'decoding': {'strategy': 'greedy'},
+            },
+            'tokenizer': {'dir': os.path.join(test_data_dir, "asr", "tokenizers", "an4_wpe_128"), 'type': 'wpe'},
+            'decoding': {'strategy': 'greedy_batch', 'greedy': {'max_symbols': 5}},
+            'loss': {'loss_name': 'default'},
+        }
+    )
+
+
+def _deterministic_hybrid(model):
+    model = model.eval()
+    model.preprocessor.featurizer.dither = 0.0
+    model.preprocessor.featurizer.pad_to = 0
+    return model
+
+
+class TestEncDecHybridRNNTCTCBPEModelWithPromptInputInjection:
+    @pytest.mark.unit
+    def test_input_only_zero_init_matches_plain_encoder(self, test_data_dir):
+        """A zero-initialized input prompt embedding is an exact no-op; perturbing one row changes only that prompt."""
+        model = _deterministic_hybrid(
+            EncDecHybridRNNTCTCBPEModelWithPrompt(cfg=_transformer_hybrid_prompt_config(test_data_dir, ['input']))
+        )
+        assert not hasattr(model, 'prompt_kernel')
+        assert torch.count_nonzero(model.prompt_input_embedding.weight) == 0
+
+        signal = torch.randn(2, 1600)
+        signal_len = torch.tensor([1600, 1200])
+        prompts = torch.tensor([2, 3])
+        with torch.no_grad():
+            encoded, encoded_len = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=prompts
+            )
+            processed, processed_len = model.preprocessor(input_signal=signal, length=signal_len)
+            expected, expected_len = model.encoder(audio_signal=processed, length=processed_len)
+        assert torch.equal(encoded_len, expected_len)
+        assert torch.allclose(encoded, expected, atol=1e-5)
+
+        with torch.no_grad():
+            model.prompt_input_embedding.weight[3].normal_()
+            perturbed, _ = model.forward(input_signal=signal, input_signal_length=signal_len, prompt_indices=prompts)
+        assert torch.allclose(perturbed[0], encoded[0], atol=1e-5)  # prompt 2 untouched
+        assert not torch.allclose(perturbed[1], encoded[1], atol=1e-5)  # prompt 3 perturbed
+
+    @pytest.mark.unit
+    def test_input_and_output_injection_feed_both_heads(self, test_data_dir):
+        model = _deterministic_hybrid(
+            EncDecHybridRNNTCTCBPEModelWithPrompt(
+                cfg=_transformer_hybrid_prompt_config(test_data_dir, ['input', 'output'])
+            )
+        )
+        assert model.concat and hasattr(model, 'prompt_kernel') and hasattr(model, 'prompt_input_embedding')
+        signal = torch.randn(2, 1600)
+        signal_len = torch.tensor([1600, 1600])
+        with torch.no_grad():
+            out_a, len_a = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=torch.tensor([1, 1])
+            )
+            out_b, _ = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=torch.tensor([2, 2])
+            )
+            logits = model.ctc_decoder(encoder_output=out_a)
+        assert out_a.shape[1] == 64 and out_a.shape == out_b.shape
+        assert torch.max(torch.abs(out_a - out_b)) > 0
+        assert logits.shape[:2] == (2, out_a.shape[2]) and logits.shape[2] == model.tokenizer.vocab_size + 1
+        with pytest.raises(ValueError, match="prompt_indices must be provided"):
+            model.forward(input_signal=signal, input_signal_length=signal_len)
+
+    @pytest.mark.unit
+    def test_invalid_prompt_injection(self, test_data_dir):
+        with pytest.raises(ValueError, match="prompt_injection"):
+            EncDecHybridRNNTCTCBPEModelWithPrompt(cfg=_transformer_hybrid_prompt_config(test_data_dir, ['decoder']))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("decoder_type", ["rnnt", "ctc"])
+    def test_transcribe_uses_manifest_language_then_target_lang(self, test_data_dir, decoder_type):
+        """transcribe() is deterministic for both heads: manifest language when known, else target_lang."""
+        import json
+
+        from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models_prompt import HybridRNNTCTCPromptTranscribeConfig
+
+        model = _deterministic_hybrid(
+            EncDecHybridRNNTCTCBPEModelWithPrompt(
+                cfg=_transformer_hybrid_prompt_config(test_data_dir, ['input', 'output'])
+            )
+        )
+        if decoder_type == "ctc":
+            model.change_decoding_strategy(decoder_type="ctc", verbose=False)
+        audio_file = os.path.join(test_data_dir, "asr", "train", "an4", "wav", "an46-mmap-b.wav")
+        entries = [
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': '', 'source_lang': 'ur'},
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': ''},  # no language
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': '', 'source_lang': 'xx'},  # unknown
+        ]
+        seen = []
+        original = model._transcribe_forward
+
+        def recording_forward(batch, trcfg):
+            seen.extend(batch[4].tolist())
+            return original(batch, trcfg)
+
+        model._transcribe_forward = recording_forward
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = os.path.join(tmpdir, 'manifest.json')
+            with open(manifest, 'w') as f:
+                f.writelines(json.dumps(entry) + '\n' for entry in entries)
+            for _ in range(2):
+                override = HybridRNNTCTCPromptTranscribeConfig(batch_size=3, target_lang='hi')
+                override.lang_field = 'source_lang'
+                hyps = model.transcribe(manifest, override_config=override)
+                assert len(hyps) == 3
+        # ur -> 3; missing and unknown languages -> target_lang 'hi' -> 2; identical across runs.
+        assert seen == [3, 2, 2, 3, 2, 2]

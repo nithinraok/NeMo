@@ -205,6 +205,9 @@ class TranscriptionConfig:
     # key for groundtruth text in manifest
     gt_text_attr_name: str = "text"
     gt_lang_attr_name: str = "lang"
+    # Language for prompt-conditioned transducers (EncDecRNNTBPEModelWithPrompt): used for utterances whose
+    # `gt_lang_attr_name` field is missing or unknown; "auto" = language-agnostic prompt. None = model default.
+    target_lang: Optional[str] = None
 
     extract_nbest: bool = False  # Extract n-best hypotheses from the model
 
@@ -420,6 +423,8 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
             override_cfg.timestamps = cfg.timestamps
             if hasattr(override_cfg, "prompt"):
                 override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(cfg.prompt))
+            if cfg.target_lang is not None and hasattr(override_cfg, "target_lang"):
+                override_cfg.target_lang = cfg.target_lang
 
             device = next(asr_model.parameters()).device
             for run_step in range(cfg.warmup_steps + cfg.run_steps):

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from dataclasses import dataclass
 from math import ceil
@@ -129,13 +130,39 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
         # Initialize concat flag
         self.concat = False
 
+        # Where the prompt conditions the model:
+        #   'output' - one-hot prompt concatenated to the encoder output and projected by prompt_kernel
+        #   'input'  - learned prompt embedding added to the pre-encoder output (zero-initialized)
+        # The CTC and RNN-T heads both read the (conditioned) encoder output.
+        self.prompt_injection = list(self.cfg.model_defaults.get('prompt_injection', ['output']))
+        unknown_injection = set(self.prompt_injection) - {'input', 'output'}
+        if unknown_injection or not self.prompt_injection:
+            raise ValueError(
+                f"model_defaults.prompt_injection must be a non-empty subset of ['input', 'output'], "
+                f"got {self.prompt_injection}."
+            )
+        if 'input' in self.prompt_injection:
+            if 'bypass_pre_encode' not in inspect.signature(self.encoder.forward).parameters:
+                raise ValueError(
+                    f"prompt_injection 'input' requires an encoder whose forward() accepts bypass_pre_encode, "
+                    f"but {type(self.encoder).__name__} does not."
+                )
+            self.prompt_input_embedding = torch.nn.Embedding(self.cfg.num_prompts, self.cfg.model_defaults.enc_hidden)
+            torch.nn.init.zeros_(self.prompt_input_embedding.weight)
+
         if self.cfg.model_defaults.get('initialize_prompt_feature', False):
             self.initialize_prompt_feature()
 
     def initialize_prompt_feature(self):
         """Initialize model components for prompt feature via concatenation."""
-        super().initialize_prompt_feature()
-        logging.info("Model with prompt feature has been initialized")
+        if 'output' in self.prompt_injection:
+            super().initialize_prompt_feature()
+        else:
+            # Input-only injection: no prompt_kernel, the encoder output is used as-is.
+            self.num_prompts = self.cfg.get('num_prompts', 128)
+        logging.info(
+            f"Model with prompt feature has been initialized (hybrid RNNT-CTC, injection={self.prompt_injection})"
+        )
 
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
@@ -270,8 +297,9 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
             batch_size = min(config['batch_size'], len(config['paths2audio_files']))
 
-        # Get target language from config
-        target_lang = config.get('target_lang', 'en-US')
+        # Each utterance uses the language in its manifest `lang_field` when that language is in the
+        # prompt dictionary, otherwise `target_lang` (which itself falls back to 'auto' if unknown).
+        target_lang = config.get('target_lang', 'auto')
 
         dl_config = {
             'manifest_filepath': manifest_filepath,
@@ -290,6 +318,9 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             'num_prompts': self.cfg.model_defaults.get('num_prompts', 128),
             'subsampling_factor': self.cfg.get('subsampling_factor', 8),
             'default_lang': target_lang,
+            'lang_field': config.get('lang_field', 'lang'),
+            'default_prompt_mode': 'langID',  # deterministic: no random 'auto' at inference
+            'fallback_unknown_lang': True,
             'window_stride': self.cfg.preprocessor.get('window_stride', 0.01),
         }
 
@@ -298,6 +329,13 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
+
+    def _transcribe_input_manifest_processing(
+        self, audio_files: List[str], temp_dir: str, trcfg: HybridRNNTCTCPromptTranscribeConfig
+    ) -> Dict:
+        ds_config = super()._transcribe_input_manifest_processing(audio_files, temp_dir, trcfg)
+        ds_config['target_lang'] = getattr(trcfg, 'target_lang', 'auto')
+        return ds_config
 
     def _transcribe_forward(self, batch: tuple[torch.Tensor, ...], trcfg: HybridRNNTCTCPromptTranscribeConfig) -> dict:
         """
@@ -544,10 +582,19 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        if 'input' in self.prompt_injection:
+            if prompt_indices is None and prompt is not None:
+                prompt_indices = prompt[:, 0, :].argmax(dim=-1)  # backward-compatible one-hot prompt
+            if prompt_indices is None:
+                raise ValueError("prompt_indices must be provided when prompt_injection includes 'input'.")
+            features, features_len = self._pre_encode(processed_signal, processed_signal_length)
+            features = features + self.prompt_input_embedding(prompt_indices).unsqueeze(1).to(features.dtype)
+            encoded, encoded_len = self.encoder(audio_signal=features, length=features_len, bypass_pre_encode=True)
+        else:
+            encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         encoded = torch.transpose(encoded, 1, 2)  # B * D * T -> B * T * D
 
-        if self.concat:
+        if self.concat and 'output' in self.prompt_injection:
             if prompt is not None:
                 # Backward-compatible path: caller provided a pre-built [B, T, D] one-hot tensor
                 if prompt.shape[1] > encoded.shape[1]:
@@ -1013,3 +1060,19 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             List of available pre-trained models.
         """
         return None
+
+    def _pre_encode(self, processed_signal, processed_signal_length):
+        """Run only the encoder's pre-encoder: (B, C, T) features -> (B, T', D) embeddings + lengths.
+
+        Mirrors the pre-encode branch of the encoder's forward so that a prompt embedding can be added
+        before the result is fed back with ``bypass_pre_encode=True``.
+        """
+        pre_encode = self.encoder.pre_encode
+        module = getattr(pre_encode, "_checkpoint_wrapped_module", pre_encode)
+        if type(module).__name__ == "FeatureStacking":
+            features, length = pre_encode(processed_signal, processed_signal_length)
+        elif isinstance(module, torch.nn.Linear):
+            features, length = pre_encode(torch.transpose(processed_signal, 1, 2)), processed_signal_length
+        else:
+            features, length = pre_encode(x=torch.transpose(processed_signal, 1, 2), lengths=processed_signal_length)
+        return features, length.to(torch.int64)
