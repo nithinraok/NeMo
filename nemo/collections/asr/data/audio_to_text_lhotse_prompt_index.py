@@ -85,20 +85,37 @@ class LhotseSpeechToTextBpeDatasetWithPromptIndex(LhotseAudioLoadingDatasetMixin
         # Index used for the language-agnostic / auto prompt
         self.auto_index = self.prompt_dict.get('auto', 101)
 
+        # With fallback_unknown_lang (set for transcription), a cut whose language is missing or not in
+        # the prompt dictionary uses default_lang ('auto' if that is unknown too) instead of raising.
+        # Training keeps the default (raise), so a misconfigured language fails fast.
+        self.fallback_unknown_lang = cfg.get('fallback_unknown_lang', False)
+        self.default_lang = cfg.get('default_lang', 'auto')
+        self._warned_unknown_keys = set()
+
         logging.info(
             f"LhotseSpeechToTextBpeDatasetWithPromptIndex: "
             f"default_prompt_mode={self.default_prompt_mode}, "
-            f"unified_auto_ratio={self.unified_auto_ratio}"
+            f"unified_auto_ratio={self.unified_auto_ratio}, "
+            f"fallback_unknown_lang={self.fallback_unknown_lang}, default_lang={self.default_lang}"
         )
 
-    def _get_prompt_index(self, prompt_key: str) -> int:
+    def _get_prompt_index(self, prompt_key: Optional[str]) -> int:
         """Maps prompt keys to indices using the prompt dictionary."""
-        if prompt_key not in self.prompt_dict:
+        if prompt_key in self.prompt_dict:
+            return self.prompt_dict[prompt_key]
+        if not self.fallback_unknown_lang:
             available_keys = list(self.prompt_dict.keys())
             raise ValueError(
                 f"Unknown prompt key: '{prompt_key}'. Available: {available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
             )
-        return self.prompt_dict[prompt_key]
+        fallback_index = self.prompt_dict.get(self.default_lang, self.auto_index)
+        if prompt_key not in self._warned_unknown_keys:
+            self._warned_unknown_keys.add(prompt_key)
+            logging.warning(
+                f"Prompt key '{prompt_key}' is not in the prompt dictionary; using default_lang "
+                f"'{self.default_lang}' (index {fallback_index}) for such utterances."
+            )
+        return fallback_index
 
     def _get_prompt_mode(self, cut) -> str:
         """Resolve the prompt_mode for a cut from its custom tags."""
