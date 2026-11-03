@@ -140,6 +140,7 @@ class TransformerAEDGreedyInfer(AEDGreedyInfer, Typing):
         confidence_method_cfg: Optional[DictConfig] = None,
         n_samples: int = 1,
         return_xattn_scores: bool = False,
+        max_generation_ratio: float = -1.0,
     ):
         super().__init__(
             transformer_decoder=transformer_decoder,
@@ -166,6 +167,7 @@ class TransformerAEDGreedyInfer(AEDGreedyInfer, Typing):
             preserve_step_confidence=preserve_token_confidence,
             confidence_method_cfg=confidence_method_cfg,
             return_xattn_scores=return_xattn_scores,
+            max_generation_ratio=max_generation_ratio,
         )
 
         self.preserve_alignments = preserve_alignments
@@ -283,6 +285,8 @@ class TransformerAEDGreedyInfer(AEDGreedyInfer, Typing):
 class AEDGreedyInferConfig:
     temperature: float | None = None
     max_generation_delta: int = -1  # -1 means up to the max length of the decoder
+    # > 0: per-utterance cap = ratio * own encoder frames + max(max_generation_delta, 0) generated tokens
+    max_generation_ratio: float = -1.0
     preserve_alignments: bool = False
     preserve_token_confidence: bool = False
     confidence_method_cfg: Optional[ConfidenceMethodConfig] = field(default_factory=lambda: ConfidenceMethodConfig())

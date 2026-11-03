@@ -190,6 +190,7 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
                 temperature=self.cfg.greedy.temperature,
                 n_samples=self.cfg.greedy.n_samples,
                 return_xattn_scores=self.cfg.get('return_xattn_scores', False),
+                max_generation_ratio=self.cfg.greedy.get('max_generation_ratio', -1.0),
             )
 
         elif strategy == 'beam':

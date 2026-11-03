@@ -107,6 +107,7 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
         preserve_step_confidence=False,
         return_xattn_scores=False,
         confidence_method_cfg: Optional[DictConfig] = None,
+        max_generation_ratio: float = -1.0,
     ):
         super().__init__()
         self.embedding = embedding
@@ -115,6 +116,9 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
         self.pad, self.bos, self.eos = pad, bos, eos
         self.max_seq_length = max_sequence_length
         self.max_delta_len = max_delta_length
+        # > 0: per-utterance cap on generated tokens = ratio * (own encoder frames) + max(max_delta_length, 0);
+        # <eos> is forced once a sequence reaches it (stops runaway repetition on short utterances in a padded batch)
+        self.max_generation_ratio = max_generation_ratio
         self.batch_size = batch_size
         self.n_samples = n_samples
         self.temperature = temperature
@@ -232,7 +236,12 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
 
         decoder_mems_list = None
         xatt_scores_list = None
+        per_utt_cap = None
+        if self.max_generation_ratio > 0 and encoder_input_mask is not None:
+            enc_lens = encoder_input_mask.sum(dim=-1).float()
+            per_utt_cap = torch.floor(self.max_generation_ratio * enc_lens).long() + max(self.max_delta_len, 0)
         for i in range(max_generation_length):
+            step = i
 
             if i == 0:
                 input_ids = tgt
@@ -262,6 +271,8 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
             else:  # Temperature sampling
                 next_tokens = Categorical(logits=logits[:, -1] / self.temperature).sample()
 
+            if per_utt_cap is not None:
+                next_tokens = torch.where(step >= per_utt_cap, torch.full_like(next_tokens, self.eos), next_tokens)
             next_tokens = self.pad * pad_profile + next_tokens * (1 - pad_profile)
             pad_profile = torch.max(pad_profile, (next_tokens == self.eos).long())
             tgt = torch.cat((tgt, next_tokens.unsqueeze(1)), dim=-1)
