@@ -54,7 +54,7 @@ python speech_to_text_aed.py \
 import lightning.pytorch as pl
 from omegaconf import OmegaConf
 
-from nemo.collections.asr.models import EncDecMultiTaskModel
+from nemo.collections.asr.models import EncDecMultiTaskCTCModel, EncDecMultiTaskModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging, model_utils
 from nemo.utils.exp_manager import exp_manager
@@ -78,7 +78,9 @@ def main(cfg):
         )
         cfg.model.tokenizer.langs.spl_tokens.dir = spl_cfg["model_dir"]
 
-    aed_model = EncDecMultiTaskModel(cfg=cfg.model, trainer=trainer)
+    # model.aux_ctc selects the AED+CTC variant (auxiliary CTC head, optional language-conditioned encoder input).
+    model_cls = EncDecMultiTaskCTCModel if cfg.model.get("aux_ctc") is not None else EncDecMultiTaskModel
+    aed_model = model_cls(cfg=cfg.model, trainer=trainer)
 
     # Initialize the weights of the model from another model, if provided via config
     aed_model.maybe_init_from_pretrained_checkpoint(cfg)
