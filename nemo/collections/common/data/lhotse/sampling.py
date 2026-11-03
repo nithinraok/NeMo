@@ -487,6 +487,30 @@ class DurationFilter:
             return True  # does not apply to text etc.
 
 
+class HighQualityFilter:
+    """
+    Callable, returns ``True`` if a cut is flagged high quality and ``False`` otherwise.
+
+    Granary-v2 manifests carry a boolean ``high_quality`` field per utterance; every manifest
+    key is attached to the cut, so it is readable as ``cut.custom["high_quality"]``. When
+    ``keep_high_quality_only`` is disabled this filter is not installed at all, so the
+    default training path is unchanged.
+
+    Cuts with no ``high_quality`` field pass through: a manifest that does not carry the flag
+    should not be silently emptied. Acts as a pass-through for non-Cut objects (text, etc.).
+    """
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+
+    def __call__(self, example) -> bool:
+        if not self.enabled:
+            return True
+        if isinstance(example, Cut) and example.has_custom("high_quality"):
+            return bool(example.high_quality)
+        return True
+
+
 class ValidationStatusFilter:
     """
     Callable, returns ``True`` if a cut's validation status is equal to keep and ``False`` otherwise.
