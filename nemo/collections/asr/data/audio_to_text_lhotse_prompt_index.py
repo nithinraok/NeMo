@@ -82,23 +82,44 @@ class LhotseSpeechToTextBpeDatasetWithPromptIndex(LhotseAudioLoadingDatasetMixin
         self.default_prompt_mode = cfg.get('default_prompt_mode', 'unified')
         self.unified_auto_ratio = cfg.get('unified_auto_ratio', 0.5)
 
+        # Optional per-cut prompt key that replaces the supervision language, also set via input_cfg tags,
+        # e.g. tags: { prompt_lang: hi-cs } on a code-switched-target copy of a Hindi dataset.
+        self.prompt_lang_field = cfg.get('prompt_lang_field', 'prompt_lang')
+
         # Index used for the language-agnostic / auto prompt
         self.auto_index = self.prompt_dict.get('auto', 101)
+
+        # With fallback_unknown_lang (set for transcription), a cut whose language is missing or not in
+        # the prompt dictionary uses default_lang ('auto' if that is unknown too) instead of raising.
+        # Training keeps the default (raise), so a misconfigured language fails fast.
+        self.fallback_unknown_lang = cfg.get('fallback_unknown_lang', False)
+        self.default_lang = cfg.get('default_lang', 'auto')
+        self._warned_unknown_keys = set()
 
         logging.info(
             f"LhotseSpeechToTextBpeDatasetWithPromptIndex: "
             f"default_prompt_mode={self.default_prompt_mode}, "
-            f"unified_auto_ratio={self.unified_auto_ratio}"
+            f"unified_auto_ratio={self.unified_auto_ratio}, "
+            f"fallback_unknown_lang={self.fallback_unknown_lang}, default_lang={self.default_lang}"
         )
 
-    def _get_prompt_index(self, prompt_key: str) -> int:
+    def _get_prompt_index(self, prompt_key: Optional[str]) -> int:
         """Maps prompt keys to indices using the prompt dictionary."""
-        if prompt_key not in self.prompt_dict:
+        if prompt_key in self.prompt_dict:
+            return self.prompt_dict[prompt_key]
+        if not self.fallback_unknown_lang:
             available_keys = list(self.prompt_dict.keys())
             raise ValueError(
                 f"Unknown prompt key: '{prompt_key}'. Available: {available_keys[:10]}{'...' if len(available_keys) > 10 else ''}"
             )
-        return self.prompt_dict[prompt_key]
+        fallback_index = self.prompt_dict.get(self.default_lang, self.auto_index)
+        if prompt_key not in self._warned_unknown_keys:
+            self._warned_unknown_keys.add(prompt_key)
+            logging.warning(
+                f"Prompt key '{prompt_key}' is not in the prompt dictionary; using default_lang "
+                f"'{self.default_lang}' (index {fallback_index}) for such utterances."
+            )
+        return fallback_index
 
     def _get_prompt_mode(self, cut) -> str:
         """Resolve the prompt_mode for a cut from its custom tags."""
@@ -107,6 +128,14 @@ class LhotseSpeechToTextBpeDatasetWithPromptIndex(LhotseAudioLoadingDatasetMixin
             if mode is not None:
                 return mode
         return self.default_prompt_mode
+
+    def _get_prompt_key(self, cut) -> Optional[str]:
+        """Prompt key for a cut: its ``prompt_lang_field`` tag if set, else the supervision language."""
+        if cut.custom is not None:
+            key = cut.custom.get(self.prompt_lang_field)
+            if key is not None:
+                return key
+        return cut.supervisions[0].language
 
     def _get_prompt_index_for_cut(self, cut) -> int:
         """
@@ -123,18 +152,18 @@ class LhotseSpeechToTextBpeDatasetWithPromptIndex(LhotseAudioLoadingDatasetMixin
         mode = self._get_prompt_mode(cut)
 
         if mode == 'langID':
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(self._get_prompt_key(cut))
         elif mode == 'auto':
             return self.auto_index
         elif mode == 'unified':
             if random.random() < self.unified_auto_ratio:
                 return self.auto_index
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(self._get_prompt_key(cut))
         else:
             logging.warning(f"Unknown prompt_mode '{mode}', falling back to unified")
             if random.random() < self.unified_auto_ratio:
                 return self.auto_index
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(self._get_prompt_key(cut))
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio_with_cuts(cuts)

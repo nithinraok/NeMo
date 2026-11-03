@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import tempfile
 
 import pytest
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
-from nemo.collections.asr.models.rnnt_bpe_models_prompt import EncDecRNNTBPEModelWithPrompt
+from nemo.collections.asr.data.audio_to_text_lhotse_prompt_index import LhotseSpeechToTextBpeDatasetWithPromptIndex
+from nemo.collections.asr.models.rnnt_bpe_models_prompt import EncDecRNNTBPEModelWithPrompt, RNNTPromptTranscribeConfig
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding as beam_decode
 from nemo.collections.asr.parts.submodules import rnnt_greedy_decoding as greedy_decode
 from nemo.collections.common import tokenizers
@@ -408,3 +410,190 @@ class TestEncDecRNNTBPEModelWithPrompt:
         assert out_a.shape == out_b.shape
         # The prompt projection should make outputs differ for different language ids.
         assert torch.max(torch.abs(out_a - out_b)) > 0
+
+
+def _transformer_prompt_model_config(test_data_dir, prompt_injection):
+    model_defaults = {
+        'enc_hidden': 64,
+        'pred_hidden': 32,
+        'initialize_prompt_feature': True,
+        'num_prompts': 8,
+        'prompt_injection': prompt_injection,
+        'prompt_dictionary': {'auto': 0, 'en': 1, 'hi': 2, 'ur': 3},
+    }
+    return DictConfig(
+        {
+            'preprocessor': {'cls': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor', 'params': {}},
+            'model_defaults': model_defaults,
+            'encoder': {
+                '_target_': 'nemo.collections.asr.modules.transformer_encoder.TransformerEncoder',
+                'feat_in': 64,
+                'd_model': model_defaults['enc_hidden'],
+                'n_heads': 4,
+                'n_layers': 1,
+                'drop_rate': 0.0,
+                'subsampling': 'feature_stacking',
+                'subsampling_factor': 4,
+                'self_attention_model': 'rope',
+            },
+            'decoder': {
+                '_target_': 'nemo.collections.asr.modules.RNNTDecoder',
+                'prednet': {'pred_hidden': model_defaults['pred_hidden'], 'pred_rnn_layers': 1},
+            },
+            'joint': {
+                '_target_': 'nemo.collections.asr.modules.RNNTJoint',
+                'jointnet': {'joint_hidden': 32, 'activation': 'relu'},
+            },
+            'tokenizer': {'dir': os.path.join(test_data_dir, "asr", "tokenizers", "an4_wpe_128"), 'type': 'wpe'},
+            'decoding': {'strategy': 'greedy_batch', 'greedy': {'max_symbols': 5}},
+            'loss': {'loss_name': 'default'},
+        }
+    )
+
+
+def _deterministic(model):
+    model = model.eval()
+    model.preprocessor.featurizer.dither = 0.0
+    model.preprocessor.featurizer.pad_to = 0
+    return model
+
+
+class TestEncDecRNNTBPEModelWithPromptInputInjection:
+    @pytest.mark.unit
+    def test_input_only_zero_init_matches_plain_encoder(self, test_data_dir):
+        """A zero-initialized input prompt embedding is an exact no-op; perturbing one row changes only that prompt."""
+        model = _deterministic(
+            EncDecRNNTBPEModelWithPrompt(cfg=_transformer_prompt_model_config(test_data_dir, ['input']))
+        )
+        assert not hasattr(model, 'prompt_kernel')
+        assert torch.count_nonzero(model.prompt_input_embedding.weight) == 0
+
+        signal = torch.randn(2, 1600)
+        signal_len = torch.tensor([1600, 1200])
+        prompts = torch.tensor([2, 3])
+        with torch.no_grad():
+            encoded, encoded_len = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=prompts
+            )
+            processed, processed_len = model.preprocessor(input_signal=signal, length=signal_len)
+            expected, expected_len = model.encoder(audio_signal=processed, length=processed_len)
+        assert torch.equal(encoded_len, expected_len)
+        assert torch.allclose(encoded, expected, atol=1e-5)
+
+        with torch.no_grad():
+            model.prompt_input_embedding.weight[3].normal_()
+            perturbed, _ = model.forward(input_signal=signal, input_signal_length=signal_len, prompt_indices=prompts)
+        assert torch.allclose(perturbed[0], encoded[0], atol=1e-5)  # prompt 2 untouched
+        assert not torch.allclose(perturbed[1], encoded[1], atol=1e-5)  # prompt 3 perturbed
+
+    @pytest.mark.unit
+    def test_input_and_output_injection(self, test_data_dir):
+        model = _deterministic(
+            EncDecRNNTBPEModelWithPrompt(cfg=_transformer_prompt_model_config(test_data_dir, ['input', 'output']))
+        )
+        assert model.concat and hasattr(model, 'prompt_kernel') and hasattr(model, 'prompt_input_embedding')
+        signal = torch.randn(2, 1600)
+        signal_len = torch.tensor([1600, 1600])
+        with torch.no_grad():
+            out_a, len_a = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=torch.tensor([1, 1])
+            )
+            out_b, _ = model.forward(
+                input_signal=signal, input_signal_length=signal_len, prompt_indices=torch.tensor([2, 2])
+            )
+        assert out_a.shape[1] == 64 and out_a.shape == out_b.shape
+        assert torch.max(torch.abs(out_a - out_b)) > 0
+        with pytest.raises(ValueError, match="prompt_indices must be provided"):
+            model.forward(input_signal=signal, input_signal_length=signal_len)
+
+    @pytest.mark.unit
+    def test_invalid_prompt_injection(self, test_data_dir):
+        with pytest.raises(ValueError, match="prompt_injection"):
+            EncDecRNNTBPEModelWithPrompt(cfg=_transformer_prompt_model_config(test_data_dir, ['decoder']))
+
+    @pytest.mark.unit
+    def test_input_injection_requires_bypass_pre_encode(self, test_data_dir, rnnt_asr_model_with_prompt):
+        cfg = rnnt_asr_model_with_prompt.cfg
+        with open_dict(cfg):
+            cfg.model_defaults.prompt_injection = ['input']
+        with pytest.raises(ValueError, match="bypass_pre_encode"):
+            EncDecRNNTBPEModelWithPrompt(cfg=cfg)
+
+    @pytest.mark.unit
+    def test_transcribe_uses_manifest_language_then_target_lang(self, test_data_dir):
+        """transcribe() must be deterministic: manifest language when known, else target_lang (never random)."""
+        model = _deterministic(
+            EncDecRNNTBPEModelWithPrompt(cfg=_transformer_prompt_model_config(test_data_dir, ['input', 'output']))
+        )
+        audio_file = os.path.join(test_data_dir, "asr", "train", "an4", "wav", "an46-mmap-b.wav")
+        entries = [
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': '', 'source_lang': 'ur'},
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': ''},  # no language
+            {'audio_filepath': audio_file, 'duration': 100000, 'text': '', 'source_lang': 'xx'},  # unknown
+        ]
+        seen = []
+        original = model._transcribe_forward
+
+        def recording_forward(batch, trcfg):
+            seen.extend(batch[4].tolist())
+            return original(batch, trcfg)
+
+        model._transcribe_forward = recording_forward
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = os.path.join(tmpdir, 'manifest.json')
+            with open(manifest, 'w') as f:
+                f.writelines(json.dumps(entry) + '\n' for entry in entries)
+            for _ in range(2):
+                override = RNNTPromptTranscribeConfig(batch_size=3, target_lang='hi')
+                override.lang_field = 'source_lang'
+                model.transcribe(manifest, override_config=override)
+        prompt_dict = model.cfg.model_defaults.prompt_dictionary
+        expected = [prompt_dict['ur'], prompt_dict['hi'], prompt_dict['hi']]
+        assert seen == expected * 2
+
+
+class TestLhotseSpeechToTextBpeDatasetWithPromptIndexFallback:
+    @pytest.mark.unit
+    def test_unknown_language_raises_by_default_and_falls_back_when_enabled(self, rnnt_asr_model_with_prompt):
+        prompt_dict = {'auto': 0, 'hi': 1, 'ur': 2}
+        strict = LhotseSpeechToTextBpeDatasetWithPromptIndex(
+            tokenizer=rnnt_asr_model_with_prompt.tokenizer, cfg={'prompt_dictionary': prompt_dict}
+        )
+        assert strict._get_prompt_index('ur') == 2
+        with pytest.raises(ValueError, match="Unknown prompt key"):
+            strict._get_prompt_index(None)
+
+        lenient = LhotseSpeechToTextBpeDatasetWithPromptIndex(
+            tokenizer=rnnt_asr_model_with_prompt.tokenizer,
+            cfg={'prompt_dictionary': prompt_dict, 'fallback_unknown_lang': True, 'default_lang': 'hi'},
+        )
+        assert lenient._get_prompt_index('ur') == 2
+        assert lenient._get_prompt_index(None) == 1
+        assert lenient._get_prompt_index('xx') == 1
+
+        lenient_auto = LhotseSpeechToTextBpeDatasetWithPromptIndex(
+            tokenizer=rnnt_asr_model_with_prompt.tokenizer,
+            cfg={'prompt_dictionary': prompt_dict, 'fallback_unknown_lang': True, 'default_lang': 'yy'},
+        )
+        assert lenient_auto._get_prompt_index(None) == 0
+
+    @pytest.mark.unit
+    def test_prompt_lang_tag_overrides_supervision_language(self, rnnt_asr_model_with_prompt):
+        from lhotse import MonoCut, SupervisionSegment
+        from lhotse.testing.dummies import dummy_recording
+
+        prompt_dict = {'auto': 0, 'hi': 1, 'hi-cs': 2}
+        dataset = LhotseSpeechToTextBpeDatasetWithPromptIndex(
+            tokenizer=rnnt_asr_model_with_prompt.tokenizer,
+            cfg={'prompt_dictionary': prompt_dict, 'default_prompt_mode': 'langID'},
+        )
+
+        def make_cut(cut_id):
+            recording = dummy_recording(0, duration=1.0)
+            supervision = SupervisionSegment(id=cut_id, recording_id=recording.id, start=0, duration=1.0, language='hi')
+            return MonoCut(id=cut_id, start=0, duration=1.0, channel=0, recording=recording, supervisions=[supervision])
+
+        native, code_switched = make_cut('native'), make_cut('code_switched')
+        code_switched.prompt_lang = 'hi-cs'  # what an input_cfg `tags: {prompt_lang: hi-cs}` entry attaches
+        assert dataset._get_prompt_index_for_cut(native) == 1
+        assert dataset._get_prompt_index_for_cut(code_switched) == 2

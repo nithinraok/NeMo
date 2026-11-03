@@ -67,6 +67,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     TokenCountFilter,
     TokenPerSecondFilter,
     TokenPerTokenFilter,
+    HighQualityFilter,
     ValidationStatusFilter,
 )
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
@@ -178,6 +179,10 @@ class LhotseDataLoadingConfig:
 
     # 2.4 Filters on validation status. If the validation status is not "pass", the cut will be filtered out.
     keep: str = "pass"
+
+    # 2.5 Keep only utterances flagged high_quality in the manifest (Granary-v2 field).
+    # Default False = use all data; the filter is not installed unless this is True.
+    keep_high_quality_only: bool = False
 
     # 3. Supported existing NeMo options.
     shuffle: bool = False
@@ -944,6 +949,8 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
 
     # validation status filtering
     cuts = cuts.filter(ValidationStatusFilter(config.keep))
+    # high-quality-only filtering (no-op unless keep_high_quality_only=True)
+    cuts = cuts.filter(HighQualityFilter(config.keep_high_quality_only))
     # Exclude cuts that contain known test speakers.
     cuts = cuts.filter(
         SpeakerFilter(
