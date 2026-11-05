@@ -65,6 +65,9 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
 
+    if cfg.get("seed") is not None:
+        pl.seed_everything(int(cfg.seed), workers=True)
+
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 

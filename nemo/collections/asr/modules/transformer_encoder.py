@@ -15,7 +15,7 @@
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 import torch
@@ -111,6 +111,7 @@ class TransformerEncoderConfig:
     self_attention_model: str = "rel_pos"
     rope_base: float = 10000.0
     rotary_fraction: float = 1.0
+    attention_dim: Optional[int] = None
 
 
 def _make_padding_mod(lengths):
@@ -250,7 +251,10 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, cfg: TransformerEncoderConfig, pos_enc=None):
         super().__init__()
         self.n_heads = cfg.n_heads
-        self.head_dim = cfg.d_model // cfg.n_heads
+        self.attention_dim = cfg.attention_dim or cfg.d_model
+        if self.attention_dim % cfg.n_heads:
+            raise ValueError("attention_dim must be divisible by n_heads.")
+        self.head_dim = self.attention_dim // cfg.n_heads
         self.d_model = cfg.d_model
         self.self_attention_model = cfg.self_attention_model
         self._uses_rel_pos = self.self_attention_model == "rel_pos"
@@ -278,8 +282,8 @@ class MultiHeadAttention(nn.Module):
         else:
             self.rope = None
 
-        self.w_qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.qkv_bias)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        self.w_qkv = nn.Linear(cfg.d_model, 3 * self.attention_dim, bias=cfg.qkv_bias)
+        self.out_proj = nn.Linear(self.attention_dim, cfg.d_model)
 
         self.qk_norm = cfg.qk_norm
         if cfg.qk_norm:
@@ -382,7 +386,7 @@ class MultiHeadAttention(nn.Module):
 
         attn_fn = _transformer_utils._get_flex_attention(q)
         out = attn_fn(q, k, v, block_mask=block_mask, score_mod=score_mod)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.attention_dim)
         return self.out_proj(out)
 
     def _apply_streaming_position(self, q, k, pos_emb, num_cur, num_kv):
@@ -682,9 +686,12 @@ class TransformerBlock(nn.Module):
         self.drop = nn.Dropout(cfg.drop_rate)
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.ffn = FeedForward(cfg)
+        self.extra_attn = None
 
-    def forward(self, x, block_mask=None, pos_emb=None):
+    def forward(self, x, block_mask=None, pos_emb=None, extra_block_mask=None):
         x = x + self.drop(self.attn(self.norm1(x), block_mask=block_mask, pos_emb=pos_emb))
+        if self.extra_attn is not None:
+            x = x + self.drop(self.extra_attn(self.extra_norm(x), block_mask=extra_block_mask, pos_emb=pos_emb))
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
@@ -704,6 +711,8 @@ class TransformerBlock(nn.Module):
             ``(x_out, new_cache)`` — the current-chunk output ``(B, C, d_model)`` and this
             layer's updated input cache.
         """
+        if self.extra_attn is not None:
+            raise NotImplementedError("Added attention requires a separate intermediate-state streaming cache.")
         C = x_cur.shape[1]
         # K/V source is the layer input over [cache | current]; Q is the current frames only.
         # LayerNorm is position-wise, so norm1([cache | cur]) == [norm1(cache) | norm1(cur)].
@@ -832,6 +841,15 @@ class TransformerEncoder(nn.Module):
             or when matching pretrained checkpoints that expect this scaling.
         attn_mode: Attention pattern — ``"full"`` (bidirectional) or ``"causal"``.
         sync_max_audio_length: When true, sync positional encoding allocation length across distributed ranks.
+        local_attention_heads: Number of final heads restricted to local_attention_context (left, right).
+            Zero preserves the global baseline. Context is measured in encoder frames, after subsampling.
+        local_attention_context: Nonnegative left/right bounds, including the query itself (4, 4 gives nine frames).
+        extra_attention_dim: Inner width of an optional second pre-norm residual attention stage before the FFN.
+            Zero disables it. The added stage does not replace or widen the existing global attention/FFN.
+        extra_attention_heads: Number of heads in the added stage; preserve the base per-head dimension.
+        extra_attention_context: None for global attention; otherwise finite left/right local bounds.
+        extra_attention_seed: Separate initialization seed, preserving shared model initialization across arms.
+            Locality controls currently support padded offline execution; streaming cache adapters are deferred.
         causal_tail_len: Length of the transient causal tail in encoder frames after subsampling.
             With ``attn_mode="full"``, zero preserves full bidirectional attention. A positive value
             leaves a bidirectional prefix and makes the final frames block-causal.
@@ -868,8 +886,36 @@ class TransformerEncoder(nn.Module):
         sync_max_audio_length: bool = True,
         causal_tail_len: int = 0,
         causal_tail_block_size: int = 1,
+        local_attention_heads: int = 0,
+        local_attention_context: Sequence[int] = (4, 4),
+        extra_attention_dim: int = 0,
+        extra_attention_heads: int = 4,
+        extra_attention_context: Optional[Sequence[int]] = None,
+        extra_attention_seed: int = 1729,
     ):
         super().__init__()
+        if not 0 <= local_attention_heads <= n_heads:
+            raise ValueError("local_attention_heads must be between zero and n_heads.")
+        if len(local_attention_context) != 2 or any(c < 0 for c in local_attention_context):
+            raise ValueError("local_attention_context must have nonnegative left/right bounds.")
+        if extra_attention_context is not None and (
+            len(extra_attention_context) != 2 or any(c < 0 for c in extra_attention_context)
+        ):
+            raise ValueError("extra_attention_context must be None (global) or nonnegative left/right bounds.")
+        if extra_attention_dim < 0 or extra_attention_heads <= 0:
+            raise ValueError("Invalid added attention dimensions.")
+        if extra_attention_dim and self_attention_model not in ("rope", "no_pos", None):
+            raise ValueError("Added narrow attention currently supports rope/no_pos.")
+        if extra_attention_dim and (
+            extra_attention_dim % extra_attention_heads
+            or extra_attention_dim // extra_attention_heads != d_model // n_heads
+        ):
+            raise ValueError("Added attention must preserve the base per-head dimension for shared RoPE.")
+        self.local_attention_heads = local_attention_heads
+        self.local_attention_context = tuple(local_attention_context)
+        self.extra_attention_dim = extra_attention_dim
+        self.extra_attention_heads = extra_attention_heads
+        self.extra_attention_context = None if extra_attention_context is None else tuple(extra_attention_context)
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads}).")
         if attn_mode not in _SUPPORTED_ATTENTION_MODES:
@@ -994,6 +1040,15 @@ class TransformerEncoder(nn.Module):
             self.out_proj = None
 
         self.set_max_audio_length(self.pos_emb_max_len)
+        if extra_attention_dim:
+            extra_cfg = replace(cfg, attention_dim=extra_attention_dim, n_heads=extra_attention_heads)
+            # Preserve initialization of every shared encoder/decoder parameter across arms.
+            # Both added-stage arms get identical extra weights, independent of locality.
+            with torch.random.fork_rng(devices=[]):
+                for index, layer in enumerate(self.layers):
+                    torch.random.default_generator.manual_seed(extra_attention_seed + index)
+                    layer.extra_norm = nn.LayerNorm(d_model)
+                    layer.extra_attn = MultiHeadAttention(extra_cfg, pos_enc=layer_pos_enc)
 
     def forward(self, audio_signal, length, bypass_pre_encode=False):
         """
@@ -1068,12 +1123,29 @@ class TransformerEncoder(nn.Module):
 
         B, T, _ = x.shape
         mask_mod = self._build_mask_mod(length)
-        block_mask = create_block_mask(mask_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)
+        if self.local_attention_heads:
+            local_mod = _make_sliding_window_mod(*self.local_attention_context)
+            base_mod = mask_mod
+            global_heads = self.n_heads - self.local_attention_heads
+
+            def mixed_mod(b, h, q_idx, kv_idx):
+                return base_mod(b, h, q_idx, kv_idx) & ((h < global_heads) | local_mod(b, h, q_idx, kv_idx))
+
+            mask_mod = mixed_mod
+        block_mask = create_block_mask(
+            mask_mod, B=B, H=self.n_heads if self.local_attention_heads else 1, Q_LEN=T, KV_LEN=T, device=x.device
+        )
+        extra_block_mask = None
+        if self.extra_attention_dim:
+            extra_mod = self._build_mask_mod(length)
+            if self.extra_attention_context is not None:
+                extra_mod = and_masks(extra_mod, _make_sliding_window_mod(*self.extra_attention_context))
+            extra_block_mask = create_block_mask(extra_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)
         # For ``abs_pos`` the positional information is already baked into ``x``, so we don't
         # need to thread ``pos_emb`` through each layer; only ``rel_pos`` consumes it.
         layer_pos_emb = pos_emb if self.self_attention_model == "rel_pos" else None
         for layer in self.layers:
-            x = layer(x, block_mask=block_mask, pos_emb=layer_pos_emb)
+            x = layer(x, block_mask=block_mask, pos_emb=layer_pos_emb, extra_block_mask=extra_block_mask)
 
         x = self.final_norm(x)
         if self.out_proj is not None:
@@ -1181,6 +1253,8 @@ class TransformerEncoder(nn.Module):
         Returns:
             Token-flat encoded states and their validated packing metadata.
         """
+        if self.local_attention_heads or self.extra_attention_dim:
+            raise NotImplementedError("Local/added attention currently uses the padded offline execution path.")
         if self.self_attention_model == "rel_pos" and not getattr(self, "_packed_rel_pos_warned", False):
             logging.warning(
                 "Sequence-packed rel_pos attention uses the compact per-utterance reference backend; "
@@ -1433,6 +1507,8 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
                 f"but got {pre_encode_cache_size}."
             )
         self.pre_encode_cache_size = pre_encode_cache_size
+        if self.local_attention_heads or self.extra_attention_dim:
+            raise NotImplementedError("Offline locality variants require head-aware streaming masks and added caches.")
         self.streaming_cfg = None
         self.att_context_size_all, self.att_context_probs = self._calc_context_sizes(
             att_context_size, att_context_probs

@@ -71,5 +71,6 @@ Further Reading
    datasets
    asr_language_modeling_and_customization
    configs
+   transformer_local_attention
    api
    featured_community_checkpoints
