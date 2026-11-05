@@ -158,3 +158,27 @@ def test_cuda_backward_with_production_head_dimensions(variant):
     assert torch.isfinite(x.grad).all()
     for name, param in model.named_parameters():
         assert param.grad is not None and torch.isfinite(param.grad).all(), name
+
+
+@pytest.mark.unit
+def test_specaugment_stream_is_independent_and_resumable():
+    from nemo.collections.asr.modules.seeded_spec_augment import SeededSpectrogramAugmentation
+
+    def augmentor():
+        return SeededSpectrogramAugmentation(freq_masks=2, time_masks=2, freq_width=4, time_width=0.2)
+
+    first, second = augmentor(), augmentor()
+    x, lengths = torch.ones(2, 16, 64), torch.tensor([64, 47])
+    outputs = []
+    for _ in range(3):
+        before = torch.random.get_rng_state()
+        a = first(input_spec=x.clone(), length=lengths)
+        assert torch.equal(before, torch.random.get_rng_state())
+        torch.rand(113)  # Simulate extra model/dropout draws in one architecture.
+        b = second(input_spec=x.clone(), length=lengths)
+        assert torch.equal(a, b)
+        outputs.append(a)
+    assert not torch.equal(outputs[0], outputs[1])
+    resumed = augmentor()
+    resumed.load_state_dict(first.state_dict())
+    assert torch.equal(first(input_spec=x.clone(), length=lengths), resumed(input_spec=x.clone(), length=lengths))

@@ -42,3 +42,8 @@ and ``StreamingTransformerEncoder`` reject them explicitly. This does not choose
 a streaming chunk size. A streaming adapter must combine head-specific locality
 with the stream's causal/chunk mask; an added attention stage also needs its own
 intermediate-input cache. Do not reuse the original layer-input cache for it.
+
+For paired architecture runs, SeededSpectrogramAugmentation in
+nemo.collections.asr.modules.seeded_spec_augment accepts augmentation_seed=42.
+Its checkpointed call counter and rank-specific seed keep vectorized time/frequency
+masks independent of model dropout. Legacy Python and rectangle masking are unsupported.
