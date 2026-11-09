@@ -3,6 +3,10 @@
 import io
 import json
 import tarfile
+from collections import Counter
+from copy import deepcopy
+from itertools import islice
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -114,3 +118,118 @@ def test_hq_filter_runs_before_tokenization_and_noise(hq_manifest, monkeypatch):
     cuts = [cut for batch in loader for cut in batch]
     assert len(calls) == 1
     assert len(cuts) == 1
+
+
+@pytest.mark.parametrize('nested', [False, True])
+@pytest.mark.parametrize('partition', [1, 5])
+def test_indexed_rejected_partition_terminates(hq_manifest, monkeypatch, nested, partition):
+    """A rejected-only worker slice must not loop inside an infinite source."""
+    from nemo.collections.common.data.lhotse.nemo_adapters import LazyNeMoTarredIterator
+
+    monkeypatch.setenv('USE_AIS_GET_BATCH', 'true')
+    monkeypatch.setattr('lhotse.dataset.dataloading.get_worker_partition', lambda: (partition, 8))
+    decode = LazyNeMoTarredIterator._decode_cut_at
+    reads = []
+
+    def bounded_decode(self, index):
+        reads.append(index)
+        assert len(reads) <= 8, 'The rejected indexed partition is being repeated indefinitely'
+        return decode(self, index)
+
+    monkeypatch.setattr(LazyNeMoTarredIterator, '_decode_cut_at', bounded_decode)
+    config = dict(
+        indexed=True,
+        input_sampling_rate=16000,
+        keep_high_quality_only=True,
+        skip_empty_text=True,
+        shuffle=False,
+        shard_seed=42,
+    )
+    if nested:
+        config['input_cfg'] = [dict(type='group', input_cfg=[dict(type='nemo_tarred', **hq_manifest)])]
+    else:
+        config.update(hq_manifest)
+    cuts, _ = read_cutset_from_config(OmegaConf.create(config))
+    with pytest.raises(StopIteration):
+        next(iter(cuts))
+    assert reads == [partition]
+
+
+@pytest.mark.parametrize('layout', ['group', 'weighted_list'])
+def test_indexed_mixture_skips_rejected_source(hq_manifest, monkeypatch, tmp_path, layout):
+    """An unavailable source must not block an eligible source in the mix."""
+    from nemo.collections.common.data.lhotse.nemo_adapters import LazyNeMoTarredIterator
+
+    monkeypatch.setenv('USE_AIS_GET_BATCH', 'true')
+    monkeypatch.setattr('lhotse.dataset.dataloading.get_worker_partition', lambda: (1, 8))
+    rows = [json.loads(line) for line in Path(hq_manifest['manifest_filepath']).read_text().splitlines()]
+    rows[1]['high_quality'] = True
+    live_path = tmp_path / 'live.jsonl'
+    live_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    config = dict(
+        indexed=True,
+        input_sampling_rate=16000,
+        keep_high_quality_only=True,
+        skip_empty_text=True,
+        shuffle=False,
+        shard_seed=42,
+        text_field='tn_raw',
+    )
+    if layout == 'group':
+        config['input_cfg'] = [
+            dict(type='nemo_tarred', **hq_manifest, weight=9),
+            dict(type='nemo_tarred', **{**hq_manifest, 'manifest_filepath': str(live_path)}, weight=1),
+        ]
+    else:
+        config.update(
+            manifest_filepath=[[hq_manifest['manifest_filepath'], 9], [str(live_path), 1]],
+            tarred_audio_filepaths=[[hq_manifest['tarred_audio_filepaths']]] * 2,
+        )
+    decode = LazyNeMoTarredIterator._decode_cut_at
+    reads = 0
+
+    def bounded_decode(self, index):
+        nonlocal reads
+        reads += 1
+        assert reads <= 120, 'A rejected source prevented the mixture from advancing'
+        return decode(self, index)
+
+    monkeypatch.setattr(LazyNeMoTarredIterator, '_decode_cut_at', bounded_decode)
+    cuts, _ = read_cutset_from_config(OmegaConf.create(config))
+    sampled = list(islice(cuts, 100))
+    assert len(sampled) == 100
+    assert all(cut.manifest_origin == str(live_path) for cut in sampled)
+    assert all(cut.custom['high_quality'] is True for cut in sampled)
+
+
+def test_indexed_filtered_mixture_preserves_weights_and_resume(hq_manifest, monkeypatch, tmp_path):
+    """Filtering before repetition retains configured weights and graph restore."""
+    monkeypatch.setenv('USE_AIS_GET_BATCH', 'true')
+    monkeypatch.setattr('lhotse.dataset.dataloading.get_worker_partition', lambda: (0, 8))
+    other = tmp_path / 'other.jsonl'
+    other.write_bytes(Path(hq_manifest['manifest_filepath']).read_bytes())
+    config = OmegaConf.create(
+        dict(
+            indexed=True,
+            input_sampling_rate=16000,
+            keep_high_quality_only=True,
+            skip_empty_text=True,
+            shuffle=False,
+            shard_seed=42,
+            text_field='tn_raw',
+            input_cfg=[
+                dict(type='nemo_tarred', **hq_manifest, weight=3),
+                dict(type='nemo_tarred', **{**hq_manifest, 'manifest_filepath': str(other)}, weight=1),
+            ],
+        )
+    )
+    cuts, _ = read_cutset_from_config(config)
+    iterator = iter(cuts)
+    counts = Counter(c.manifest_origin for c in islice(iterator, 4000))
+    assert abs(counts[hq_manifest['manifest_filepath']] / 4000 - 0.75) < 0.03
+    state = deepcopy(cuts.data.state_dict())
+    expected = [(c.id, c.manifest_origin, c.supervisions[0].text) for c in islice(iterator, 32)]
+    restored, _ = read_cutset_from_config(config)
+    restored.data.load_state_dict(state)
+    actual = [(c.id, c.manifest_origin, c.supervisions[0].text) for c in islice(restored, 32)]
+    assert actual == expected

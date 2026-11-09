@@ -1817,6 +1817,9 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                     **common_kwargs,
                 )
             )
+            # Filter a finite worker slice before repeating it. Filtering an
+            # infinite rejected-only slice never yields or reaches exhaustion.
+            cuts = _filter_cut_metadata(cuts, config)
             if not force_finite:
                 cuts = cuts.repeat(preserve_id=True)
         else:
@@ -1882,10 +1885,10 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
             #   to the one desired in spite of the limit.
             if config.get("max_open_streams") is not None:
                 for subiter in nemo_iter.to_shards():
-                    cutsets.append(CutSet(subiter))
+                    cutsets.append(_filter_cut_metadata(CutSet(subiter), config))
                     weights.append(weight)
             else:
-                cutsets.append(CutSet(nemo_iter))
+                cutsets.append(_filter_cut_metadata(CutSet(nemo_iter), config))
                 weights.append(weight)
         cuts = mux(
             *cutsets,
