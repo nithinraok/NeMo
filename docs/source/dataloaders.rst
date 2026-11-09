@@ -967,6 +967,15 @@ When set at the top level, ``indexed: true`` is propagated by
 top-level flag covers every nested ``input_cfg`` group. You can still override
 it per-source if needed.
 
+For large indexed mixtures with Lhotse 2.0.0a6, set
+``cache_indexed_restore_capabilities: true`` at the top level to avoid
+repeatedly traversing the source graph for every buffered cut during worker
+state capture. This caches a structural capability; it does not change source
+weights, filtering, or sample order. The default is ``false`` to preserve
+existing checkpoint graphs. Enable it when starting a new run and keep the
+setting unchanged on resume: native checkpoints record the added cache nodes
+and reject restoration into a graph with different node types.
+
 Per-adapter support
 ^^^^^^^^^^^^^^^^^^^
 

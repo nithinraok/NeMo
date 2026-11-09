@@ -31,7 +31,13 @@ import soundfile as sf
 from lhotse import CutSet, Features, MonoCut, Recording, SupervisionSegment
 from lhotse.array import Array, TemporalArray
 from lhotse.cut import Cut, MixedCut, PaddingCut
-from lhotse.lazy import LazyIteratorChain
+from lhotse.lazy import (
+    IteratorNode,
+    LazyIteratorChain,
+    _try_collect_child_state,
+    _try_restore_child_state,
+    supports_graph_restore,
+)
 from lhotse.serialization import load_yaml
 from lhotse.utils import fastcopy
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -152,6 +158,8 @@ def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bo
 
         cuts = _filter_cut_metadata(cuts, config)
 
+    if config.get('cache_indexed_restore_capabilities', False):
+        cuts = _cache_cutset_restore_capability(cuts)
     return cuts, is_tarred
 
 
@@ -2114,3 +2122,44 @@ def _filter_cut_metadata(cuts: CutSet, config: DictConfig) -> CutSet:
     if config.get("skip_empty_text", False):
         cuts = cuts.filter(NonEmptyTextFilter())
     return cuts
+
+
+class _CachedRestoreCapability(IteratorNode):
+    """Cache a fixed capability while forwarding iteration, origins, and source state."""
+
+    has_constant_time_access = True
+
+    def __init__(self, source):
+        self.source = source
+        self.is_indexed = getattr(source, 'is_indexed', False)
+        self.is_checkpointable = getattr(source, 'is_checkpointable', False)
+
+    def __iter__(self):
+        return iter(self.source)
+
+    def __getitem__(self, index):
+        return self.source[index]
+
+    def state_dict(self):
+        return _try_collect_child_state(self.source)
+
+    def load_state_dict(self, state):
+        _try_restore_child_state(self.source, state)
+
+
+class _SizedCachedRestoreCapability(_CachedRestoreCapability):
+    def __len__(self):
+        return len(self.source)
+
+
+def _cache_cutset_restore_capability(cuts: CutSet) -> CutSet:
+    # Lhotse 2.0.0a6 checks this structural property for every buffered cut
+    # during state capture/restore. A large weighted source graph makes those
+    # repeated recursive walks dominate startup and each worker snapshot.
+    # Graph structure is fixed; RNG/epoch/position restoration cannot change
+    # whether its sources support indexing. Keep non-restorable graphs intact.
+    source = cuts.data
+    if isinstance(source, _CachedRestoreCapability) or not supports_graph_restore(source):
+        return cuts
+    wrapper = _SizedCachedRestoreCapability if hasattr(source, '__len__') else _CachedRestoreCapability
+    return CutSet(wrapper(source))

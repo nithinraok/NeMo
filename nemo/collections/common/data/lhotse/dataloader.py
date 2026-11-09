@@ -48,6 +48,7 @@ from nemo.collections.common.data.lhotse.audio_loading import configure_dataset_
 from nemo.collections.common.data.lhotse.audio_token_estimator import AudioTokenEstimator
 from nemo.collections.common.data.lhotse.cutset import (
     IncompleteConfigError,
+    _cache_cutset_restore_capability,
     guess_parse_cutset,
     read_cutset_from_config,
 )
@@ -94,6 +95,10 @@ class LhotseDataLoadingConfig:
     shar_path: Any = None  # str | list[str | tuple[str, float | int]] | None = None
     #  Enable this to support dataloading from JSON manifests that reference subsets of audio tar files.
     skip_missing_manifest_entries: bool = False
+    # Avoid repeated whole-graph checks in Lhotse 2.0.0a6 worker snapshots.
+    # This adds native checkpoint graph nodes: keep the setting fixed on resume.
+    # Opt-in preserves the graph structure of existing checkpointed experiments.
+    cache_indexed_restore_capabilities: bool = False
     # Continue past unreadable, missing, or corrupted audio payloads. Disable for fail-fast diagnostics.
     # This is independent of skip_missing_manifest_entries, which only handles tar members absent from JSONL.
     fault_tolerant_audio_loading: bool = True
@@ -974,6 +979,11 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         config,
         audio_token_estimator=audio_token_estimator,
     )
+
+    # Cache again after tokenization/augmentation/filtering so bucketer state
+    # capture also avoids rechecking the fixed outer graph for every cut.
+    if config.cache_indexed_restore_capabilities:
+        cuts = _cache_cutset_restore_capability(cuts)
 
     # 3. The sampler.
     if config.use_bucketing:
