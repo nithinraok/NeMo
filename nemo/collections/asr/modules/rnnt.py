@@ -1317,9 +1317,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             When this flag is set, prior to calling forward, the fields `loss` and `wer` (either one) *must*
             be set using the `RNNTJoint.set_loss()` or `RNNTJoint.set_wer()` methods.
 
-            Further, when this flag is set, the following argument `fused_batch_size` *must* be provided
-            as a non negative integer. This value refers to the size of the sub-batch.
-
             When the flag is set, the input and output signature of `forward()` of this method changes.
             Input - in addition to `encoder_outputs` (mandatory argument), the following arguments can be provided.
 
@@ -1342,8 +1339,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 - wer_numerator + wer_denominator (optional). Returned if transcripts, transcripts_lengths are provided
                     and compute_wer is set.
 
-        fused_batch_size: Optional int, required if `fuse_loss_wer` flag is set. Determines the size of the
-            sub-batches. Should be any value below the actual batch size per GPU.
+        fused_batch_size: Number of utterances per sub-batch. Required for fused execution with
+            sub-batching. Factorized-joint losses consume the whole batch and can omit this setting.
         masking_prob: Optional float, indicating the probability of masking out decoder output in HAINAN
             (Hybrid Autoregressive Inference Transducer) model, described in https://arxiv.org/pdf/2410.02597
             Default to -1.0, which runs standard Joint network computation; if > 0, then masking out decoder output
@@ -1432,9 +1429,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self._fuse_loss_wer = fuse_loss_wer
         self._fused_batch_size = fused_batch_size
 
-        if fuse_loss_wer and (fused_batch_size is None):
-            raise ValueError("If `fuse_loss_wer` is set, then `fused_batch_size` cannot be None!")
-
         self._loss = None
         self._wer = None
 
@@ -1456,7 +1450,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.activation = jointnet['activation']
 
         # Optional arguments
-        dropout = jointnet.get('dropout', 0.0)
+        self.dropout = jointnet.get('dropout', 0.0)
 
         self.pred, self.enc, self.joint_net = self._joint_net_modules(
             num_classes=self._num_classes,  # add 1 for blank symbol
@@ -1464,7 +1458,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             enc_n_hidden=self.encoder_hidden,
             joint_n_hidden=self.joint_hidden,
             activation=self.activation,
-            dropout=dropout,
+            dropout=self.dropout,
         )
 
         # Flag needed for RNNT export support
@@ -1474,6 +1468,37 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.temperature = 1.0
 
         self.hypotheses = None
+
+    def _compute_wer(self, encoder_outputs, encoder_lengths, transcripts, transcript_lengths, keep_hypotheses):
+        """Decode one batch of encoder states and return its WER, numerator, denominator and hypotheses.
+
+        Args:
+            encoder_outputs: Encoder states of shape [B, T, D].
+        """
+        predictions = encoder_outputs.transpose(1, 2).detach()  # [B, T, D] -> [B, D, T]
+        transcripts = transcripts.detach()
+
+        # Update WER on each process without syncing
+        if self.training:
+            original_sync = self.wer._to_sync
+            self.wer._to_sync = False
+
+        self.wer.update(
+            predictions=predictions,
+            predictions_lengths=encoder_lengths,
+            targets=transcripts,
+            targets_lengths=transcript_lengths,
+        )
+        hypotheses = self.wer.get_hypotheses() if keep_hypotheses else []
+
+        # Sync and all_reduce on all processes, compute global WER
+        wer, wer_num, wer_denom = self.wer.compute()
+        self.wer.reset()
+
+        if self.training:
+            self.wer._to_sync = original_sync
+
+        return wer, wer_num, wer_denom, hypotheses
 
     @typecheck()
     def forward(
@@ -1508,15 +1533,37 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             if self._loss is None or self._wer is None:
                 raise ValueError("`fuse_loss_wer` flag is set, but `loss` and `wer` modules were not provided! ")
 
-            # If fused joint step is required, fused batch size is required as well
-            if self._fused_batch_size is None:
-                raise ValueError("If `fuse_loss_wer` is set, then `fused_batch_size` cannot be None!")
-
             # When using fused joint step, both encoder and transcript lengths must be provided
             if (encoder_lengths is None) or (transcript_lengths is None):
                 raise ValueError(
                     "`fuse_loss_wer` is set, therefore encoder and target lengths " "must be provided as well!"
                 )
+
+            if getattr(self._loss, "requires_factorized_joint", False):
+                # This loss consumes the projections directly and tiles the lattice itself,
+                # so the sub-batch loop below has nothing left to do.
+                losses = wer = wer_num = wer_denom = None
+                if decoder_outputs is not None:
+                    losses = self.loss.forward_from_joint(
+                        joint=self,
+                        encoder=encoder_outputs,
+                        predictor=decoder_outputs,
+                        targets=transcripts,
+                        input_lengths=encoder_lengths,
+                        target_lengths=transcript_lengths,
+                    )
+                hypotheses = []
+                if compute_wer:
+                    # One decode, so `wer` is total errors over total words. The loop below
+                    # averages per-chunk ratios instead; wer_num and wer_denom are unaffected.
+                    wer, wer_num, wer_denom, hypotheses = self._compute_wer(
+                        encoder_outputs, encoder_lengths, transcripts, transcript_lengths, keep_hypotheses
+                    )
+                self.hypotheses = hypotheses if keep_hypotheses else None
+                return losses, wer, wer_num, wer_denom
+
+            if self._fused_batch_size is None:
+                raise ValueError("`fused_batch_size` is required for fused joint sub-batching.")
 
             losses = []
             wers, wer_nums, wer_denoms = [], [], []
@@ -1592,31 +1639,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
                 # Update WER for sub batch
                 if compute_wer:
-                    sub_enc = sub_enc.transpose(1, 2)  # [B, T, D] -> [B, D, T]
-                    sub_enc = sub_enc.detach()
-                    sub_transcripts = sub_transcripts.detach()
-
-                    # Update WER on each process without syncing
-                    if self.training:
-                        original_sync = self.wer._to_sync
-                        self.wer._to_sync = False
-
-                    self.wer.update(
-                        predictions=sub_enc,
-                        predictions_lengths=sub_enc_lens,
-                        targets=sub_transcripts,
-                        targets_lengths=sub_transcript_lens,
+                    wer, wer_num, wer_denom, hyp = self._compute_wer(
+                        sub_enc, sub_enc_lens, sub_transcripts, sub_transcript_lens, keep_hypotheses
                     )
-
-                    hyp = self.wer.get_hypotheses() if keep_hypotheses else []
-
-                    # Sync and all_reduce on all processes, compute global WER
-                    wer, wer_num, wer_denom = self.wer.compute()
-                    self.wer.reset()
-
-                    if self.training:
-                        self.wer._to_sync = original_sync
-
                     wers.append(wer)
                     wer_nums.append(wer_num)
                     wer_denoms.append(wer_denom)
@@ -2029,6 +2054,9 @@ class SampledRNNTJoint(RNNTJoint):
                 transcript_lengths=transcript_lengths,
                 compute_wer=compute_wer,
             )
+
+        if getattr(self._loss, "requires_factorized_joint", False):
+            raise ValueError("A factorized-joint loss needs the full vocabulary and cannot use SampledRNNTJoint")
 
         if transcripts is None or transcript_lengths is None:
             logging.warning(
